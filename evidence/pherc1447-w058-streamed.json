@@ -1,0 +1,60 @@
+{
+  "cli": [
+    "work/control/w058.zarr",
+    "work/models/reader-v3.pth",
+    "work/candidate/w058.tif",
+    "--direction",
+    "both",
+    "--device",
+    "mps",
+    "--amp-dtype",
+    "default",
+    "--no-compile",
+    "--num-workers",
+    "0",
+    "--batch-size",
+    "4",
+    "--overlap",
+    "0.5",
+    "--blend-mode",
+    "hann",
+    "--chunk-cache-size",
+    "64",
+    "--max-ram-accumulation-gb",
+    "0"
+  ],
+  "torch": "2.15.0",
+  "seconds": 21.019131333043333,
+  "accumulator_flush_seconds": 0.04146229010075331,
+  "model_and_loader_with_accumulator_seconds": 20.518201166996732,
+  "scratch_at_finalization": [],
+  "peak_rss_bytes_macos": 969129984,
+  "outputs": [
+    {
+      "file": "w058.tif",
+      "shape": [
+        1536,
+        1536
+      ],
+      "decoded_sha256": "de71be0ff3025d1b3a0d43ebe4932530e15d8c5718b8a70a97449e1dc9debcbd",
+      "tiff_sha256": "5c0200980051776b2ec92574de585cb306c916343533f656a49dea6458c3c300",
+      "tiff_bytes": 732066,
+      "nonzero_pixels": 2359296,
+      "min": 54,
+      "max": 216
+    },
+    {
+      "file": "w058_reverse.tif",
+      "shape": [
+        1536,
+        1536
+      ],
+      "decoded_sha256": "63e42cb09f88f16eb960ca6fd333c94e43d567dc70e8f38de860a66e57bb2d1c",
+      "tiff_sha256": "bb465c7999e08f08335bceae64ce94aa576396d84427f5b8edf3cca48d78c98b",
+      "tiff_bytes": 993090,
+      "nonzero_pixels": 2359296,
+      "min": 47,
+      "max": 226
+    }
+  ]
+}

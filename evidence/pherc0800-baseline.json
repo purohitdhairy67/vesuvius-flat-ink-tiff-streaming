@@ -1,0 +1,70 @@
+{
+  "cli": [
+    "work/data/20251028222030/surface-volumes/8.64um-1.2m-116keV-volume-20250521135224.zarr",
+    "work/models/reader-v3.pth",
+    "work/baseline/20251028222030.tif",
+    "--direction",
+    "both",
+    "--device",
+    "mps",
+    "--amp-dtype",
+    "default",
+    "--no-compile",
+    "--num-workers",
+    "0",
+    "--batch-size",
+    "4",
+    "--overlap",
+    "0.5",
+    "--blend-mode",
+    "hann",
+    "--chunk-cache-size",
+    "64",
+    "--max-ram-accumulation-gb",
+    "0"
+  ],
+  "torch": "2.15.0",
+  "seconds": 58.044157374999486,
+  "accumulator_flush_seconds": 0.16645658307243139,
+  "model_and_loader_with_accumulator_seconds": 56.59574895800324,
+  "final_tiff_and_scratch_stat_seconds": 0.15171070804353803,
+  "scratch_at_finalization": [
+    {
+      "bytes": 25477135,
+      "files": 92
+    },
+    {
+      "bytes": 25327357,
+      "files": 92
+    }
+  ],
+  "peak_rss_bytes_macos": 811368448,
+  "outputs": [
+    {
+      "file": "20251028222030.tif",
+      "shape": [
+        2580,
+        2580
+      ],
+      "decoded_sha256": "3faf2f1c915ecba14bd94ecf558620bd614bfbd531bd5681c33f6445ef1d0fc2",
+      "tiff_sha256": "eeafd1122220c6e01feb06b3c750e9a83dae3e33af5e0e90461ac55d893e17fd",
+      "tiff_bytes": 1413272,
+      "nonzero_pixels": 5649408,
+      "min": 0,
+      "max": 226
+    },
+    {
+      "file": "20251028222030_reverse.tif",
+      "shape": [
+        2580,
+        2580
+      ],
+      "decoded_sha256": "3b0cd688af40f4d727c4c8e454e68cacc5ae077169ff9467f0142fcbb220640d",
+      "tiff_sha256": "74bfacc0d55f8ff1cc784d22b5bc8709a945fa03bad1be3e14e21eb0e311c230",
+      "tiff_bytes": 1316646,
+      "nonzero_pixels": 5649408,
+      "min": 0,
+      "max": 226
+    }
+  ]
+}

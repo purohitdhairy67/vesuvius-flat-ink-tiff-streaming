@@ -1,0 +1,502 @@
+diff --git a/vesuvius/docs/ink_detection.md b/vesuvius/docs/ink_detection.md
+index bbda1bd..10ce09a 100644
+--- a/vesuvius/docs/ink_detection.md
++++ b/vesuvius/docs/ink_detection.md
+@@ -456,6 +456,7 @@ the second output.
+ | `--num-workers`, `--workers` | DataLoader workers, default `4`. |
+ | `--prefetch-factor` | Per-worker prefetch factor, default `2`. |
+ | `--chunk-cache-size` | Decoded source chunks retained per worker; default `0` disables caching. RAM use scales with chunk dimensions, dtype, selected depth, and worker count. Concurrent threads share pending reads. |
++| `--max-ram-accumulation-gb` | Keep two float32 accumulation planes in RAM when they fit within this GiB limit (default 2). Above the limit, blend and write completed tiles directly to TIFF. Set to 0 to always use the streaming path. |
+ | `--overlap` | Inference overlap fraction in `[0,1)`, default `0.5`. |
+ | `--stride` | Explicit pixel stride; overrides `--overlap`. |
+ | `--blend-mode` | `auto`, `constant`, `gaussian`, or `hann`; default `auto` (constant without overlap, Hann otherwise). |
+diff --git a/vesuvius/src/vesuvius/ink_detection/inference/infer.py b/vesuvius/src/vesuvius/ink_detection/inference/infer.py
+index 30d7b8f..8ccb20b 100644
+--- a/vesuvius/src/vesuvius/ink_detection/inference/infer.py
++++ b/vesuvius/src/vesuvius/ink_detection/inference/infer.py
+@@ -8,16 +8,15 @@ import argparse
+ import json
+ import logging
+ import math
+-import shutil
+-import tempfile
+ import threading
+ from concurrent.futures import Future, ThreadPoolExecutor
+ from collections import OrderedDict
+ from contextlib import nullcontext
+ from dataclasses import dataclass, replace
++from functools import partial
+ from datetime import datetime
+ from pathlib import Path
+-from typing import Any, Iterator, Mapping, Sequence
++from typing import Any, Callable, Iterator, Mapping, Sequence
+ from urllib.parse import urlparse
+ 
+ import numpy as np
+@@ -26,7 +25,6 @@ import torch
+ import torch.nn.functional as F
+ from torch import nn
+ from torch.utils.data import DataLoader, Dataset
+-from vc_reader.reader import ZarrWriter
+ 
+ from vesuvius.ink_detection.models.checkpoint import (
+     load_checkpoint,
+@@ -785,16 +783,14 @@ class ChunkAccumulator:
+         *,
+         shape: tuple[int, int],
+         chunk_shape: tuple[int, int],
+-        prob_sum_store: Any,
+-        weight_sum_store: Any,
++        write_chunk: Callable[[int, int, np.ndarray, np.ndarray], None],
+         contribution_counts: Mapping[ChunkKey, int],
+     ) -> None:
+         self.height, self.width = (int(value) for value in shape)
+         self.chunk_h, self.chunk_w = (
+             max(1, int(value)) for value in chunk_shape
+         )
+-        self.prob_sum_store = prob_sum_store
+-        self.weight_sum_store = weight_sum_store
++        self.write_chunk = write_chunk
+         self.contribution_counts = dict(contribution_counts)
+         self.seen_counts: dict[ChunkKey, int] = {}
+         self.buffers: dict[ChunkKey, tuple[np.ndarray, np.ndarray]] = {}
+@@ -871,9 +867,8 @@ class ChunkAccumulator:
+     def _flush(self, key: ChunkKey) -> None:
+         probability, weight = self.buffers.pop(key)
+         self.seen_counts.pop(key, None)
+-        y0, y1, x0, x1 = self._bounds(key)
+-        self.prob_sum_store[y0:y1, x0:x1] = probability
+-        self.weight_sum_store[y0:y1, x0:x1] = weight
++        y0, _, x0, _ = self._bounds(key)
++        self.write_chunk(y0, x0, probability, weight)
+ 
+     def flush_remaining(self) -> None:
+         """Flush any remaining accumulation buffers."""
+@@ -1015,6 +1010,14 @@ def run_block_inference(
+                 )
+ 
+ 
++def encode_probability_tile(probability: np.ndarray, weight: np.ndarray) -> np.ndarray:
++    """Normalize the accumulated sums in place and truncate to uint8."""
++    np.divide(probability, weight, out=probability, where=weight > 1e-6)
++    np.clip(probability, 0, 1, out=probability)
++    probability *= 255
++    return probability.astype(np.uint8, copy=False)
++
++
+ def iter_probability_tiles(
+     prob_sum_store: Any,
+     weight_sum_store: Any,
+@@ -1033,10 +1036,7 @@ def iter_probability_tiles(
+             weight = np.asarray(
+                 weight_sum_store[y0:y1, x0:x1], dtype=np.float32
+             )
+-            np.divide(probability, weight, out=probability, where=weight > 1e-6)
+-            np.clip(probability, 0, 1, out=probability)
+-            probability *= 255
+-            yield probability.astype(np.uint8, copy=False)
++            yield encode_probability_tile(probability, weight)
+ 
+ 
+ def write_output_tiff(
+@@ -1056,15 +1056,76 @@ def write_output_tiff(
+             writer.write_tile(y0, x0, tile)
+ 
+ 
+-def open_temp_zarr_array(
+-    path: Path,
+-    *,
+-    shape: tuple[int, int],
+-    chunks: tuple[int, int],
+-):
+-    """Create one explicit-v2 float32 accumulation array."""
++def store_probability_chunk(
++    prob_sum_store: np.ndarray,
++    weight_sum_store: np.ndarray,
++    y0: int,
++    x0: int,
++    probability: np.ndarray,
++    weight: np.ndarray,
++) -> None:
++    """Copy the finished chunk into the in-memory output sums."""
++    height, width = probability.shape
++    destination = np.s_[y0 : y0 + height, x0 : x0 + width]
++    prob_sum_store[destination] = probability
++    weight_sum_store[destination] = weight
++
+ 
+-    return ZarrWriter.create(path, shape=shape, chunks=chunks, dtype=np.float32, overwrite=True, auth=None)
++def write_flat_output(
++    *,
++    output_path: Path,
++    output_shape: tuple[int, int],
++    tile_shape: tuple[int, int],
++    blocks: Sequence[Block],
++    max_ram_accumulation_gb: float,
++    consume: Callable[[ChunkAccumulator], None],
++) -> None:
++    """Blend in bounded chunks and publish the output TIFF."""
++    def accumulate(
++        chunk_shape: tuple[int, int],
++        write_chunk: Callable[[int, int, np.ndarray, np.ndarray], None],
++    ) -> None:
++        accumulator = ChunkAccumulator(
++            shape=output_shape,
++            chunk_shape=chunk_shape,
++            write_chunk=write_chunk,
++            contribution_counts=compute_chunk_contribution_counts(
++                blocks, chunk_shape=chunk_shape
++            ),
++        )
++        consume(accumulator)
++        accumulator.flush_remaining()
++
++    metadata_path = output_path.with_suffix(output_path.suffix + ".roi.json")
++    accumulation_bytes = 2 * np.dtype(np.float32).itemsize * math.prod(output_shape)
++    if accumulation_bytes <= max_ram_accumulation_gb * 1024**3:
++        LOGGER.info("Accumulating in RAM (%.2f GiB)", accumulation_bytes / 1024**3)
++        probability_sum = np.zeros(output_shape, dtype=np.float32)
++        weight_sum = np.zeros(output_shape, dtype=np.float32)
++        accumulation_chunks = tuple(min(tile, size) for tile, size in zip(tile_shape, output_shape))
++        accumulate(accumulation_chunks, partial(store_probability_chunk, probability_sum, weight_sum))
++        metadata_path.unlink(missing_ok=True)
++        write_output_tiff(probability_sum, weight_sum, output_path, tile_shape)
++        return
++
++    LOGGER.info("Writing completed accumulation tiles directly to TIFF")
++    with images.TiffWriter(output_path, output_shape, np.uint8, compression="lzw", tile=tile_shape) as writer:
++        # LibTIFF tile sides are multiples of 16. Use the writer's actual grid.
++        chunk_shape = tuple(writer.tile)
++        wrote_tile = False
++
++        def write_chunk(y0: int, x0: int, probability: np.ndarray, weight: np.ndarray) -> None:
++            nonlocal wrote_tile
++            writer.write_tile(y0, x0, encode_probability_tile(probability, weight))
++            wrote_tile = True
++
++        accumulate(chunk_shape, write_chunk)
++        if not wrote_tile:
++            # Enter tiled mode for a wholly empty surface. The writer fills all
++            # remaining unwritten tiles with zeros when it closes.
++            first_shape = tuple(min(tile, size) for tile, size in zip(chunk_shape, output_shape))
++            writer.write_tile(0, 0, np.zeros(first_shape, dtype=np.uint8))
++        metadata_path.unlink(missing_ok=True)
+ 
+ 
+ def load_grayscale_mask(path: Path, target_shape: tuple[int, int]) -> np.ndarray:
+@@ -1395,80 +1456,41 @@ def infer_single_zarr(
+         else ()
+     )
+ 
+-    temporary = Path(tempfile.mkdtemp(prefix="ink_flat_infer_"))
+-    try:
+-        accumulation_chunks = (
+-            min(tile_shape[0], output_shape[0]),
+-            min(tile_shape[1], output_shape[1]),
+-        )
+-        accumulation_bytes = 2 * 4 * output_shape[0] * output_shape[1]
+-        if accumulation_bytes <= args.max_ram_accumulation_gb * 1024**3:
+-            # Two float32 planes in RAM avoid one temp-zarr write per chunk
+-            # here and one read per chunk when the TIFF is encoded.
+-            LOGGER.info(
+-                "Accumulating in RAM (%.2f GiB)", accumulation_bytes / 1024**3
+-            )
+-            probability_sum = np.zeros(output_shape, dtype=np.float32)
+-            weight_sum = np.zeros(output_shape, dtype=np.float32)
+-        else:
+-            probability_sum = open_temp_zarr_array(
+-                temporary / "probability.zarr",
+-                shape=output_shape,
+-                chunks=accumulation_chunks,
+-            )
+-            weight_sum = open_temp_zarr_array(
+-                temporary / "weight.zarr",
+-                shape=output_shape,
+-                chunks=accumulation_chunks,
+-            )
+-        accumulator = ChunkAccumulator(
+-            shape=output_shape,
+-            chunk_shape=accumulation_chunks,
+-            prob_sum_store=probability_sum,
+-            weight_sum_store=weight_sum,
+-            contribution_counts=compute_chunk_contribution_counts(
+-                output_blocks, chunk_shape=accumulation_chunks
+-            ),
++    def consume(accumulator: ChunkAccumulator) -> None:
++        if not blocks:
++            LOGGER.warning("No occupied blocks were found; writing an all-zero output")
++            return
++        run_block_inference(
++            loader=loader,
++            model=configured_model.model,
++            accumulator=accumulator,
++            weight_map=weight_map,
++            mask=mask,
++            device=device,
++            amp_dtype=configured_model.amp_dtype,
++            tta_axes=tta_axes,
++            tta_batch_size=args.tta_batch_size,
++            roi_bounds=roi_bounds,
+         )
+-        if blocks:
+-            run_block_inference(
+-                loader=loader,
+-                model=configured_model.model,
+-                accumulator=accumulator,
+-                weight_map=weight_map,
+-                mask=mask,
+-                device=device,
+-                amp_dtype=configured_model.amp_dtype,
+-                tta_axes=tta_axes,
+-                tta_batch_size=args.tta_batch_size,
+-                roi_bounds=roi_bounds,
+-            )
+-            accumulator.flush_remaining()
+-        else:
+-            LOGGER.warning(
+-                "No occupied blocks were found; writing an all-zero output"
+-            )
++
++    write_flat_output(
++        output_path=output_tiff,
++        output_shape=output_shape,
++        tile_shape=tile_shape,
++        blocks=output_blocks,
++        max_ram_accumulation_gb=args.max_ram_accumulation_gb,
++        consume=consume,
++    )
++    if roi_bounds is not None:
+         metadata_path = output_tiff.with_suffix(output_tiff.suffix + ".roi.json")
+-        # An overwritten full-frame image must not inherit a previous ROI's frame.
+-        # Invalidate the old metadata before replacing its associated image.
+-        metadata_path.unlink(missing_ok=True)
+-        write_output_tiff(
+-            probability_sum,
+-            weight_sum,
+-            output_tiff,
+-            tile_shape,
+-        )
+-        if roi_bounds is not None:
+-            metadata_path.write_text(json.dumps({
+-                "input": str(input_zarr), "input_resolution": resolution,
+-                "parent_shape_yx": [height, width],
+-                "roi_row_start_stop_col_start_stop": list(roi_bounds),
+-                "patch_size": patch_size, "stride": stride, "blend_mode": blend_mode,
+-                "layer_indices": layer_indices.tolist(), "direction": layer_direction,
+-                "parent_grid_retained": True,
+-            }, indent=2) + "\n", encoding="utf-8")
+-    finally:
+-        shutil.rmtree(temporary, ignore_errors=True)
++        metadata_path.write_text(json.dumps({
++            "input": str(input_zarr), "input_resolution": resolution,
++            "parent_shape_yx": [height, width],
++            "roi_row_start_stop_col_start_stop": list(roi_bounds),
++            "patch_size": patch_size, "stride": stride, "blend_mode": blend_mode,
++            "layer_indices": layer_indices.tolist(), "direction": layer_direction,
++            "parent_grid_retained": True,
++        }, indent=2) + "\n", encoding="utf-8")
+ 
+ 
+ def resolve_run_directions(direction: str) -> tuple[str, ...]:
+@@ -1664,7 +1686,7 @@ def parse_args(argv: Sequence[str] | None = None):
+         type=float,
+         default=2.0,
+         help="Keep the float32 probability/weight sums in RAM when they fit "
+-        "in this many GiB; larger outputs use temporary Zarr arrays",
++        "in this many GiB; larger outputs write completed tiles directly to TIFF",
+     )
+     parser.add_argument(
+         "--loader-threads",
+diff --git a/vesuvius/tests/ink_detection/test_flat_inference.py b/vesuvius/tests/ink_detection/test_flat_inference.py
+index 2ba7844..068594a 100644
+--- a/vesuvius/tests/ink_detection/test_flat_inference.py
++++ b/vesuvius/tests/ink_detection/test_flat_inference.py
+@@ -2,7 +2,8 @@
+ 
+ from __future__ import annotations
+ 
+-import json
++from functools import partial
++
+ from pathlib import Path
+ import tempfile
+ from types import SimpleNamespace
+@@ -30,7 +31,7 @@ from vesuvius.ink_detection.inference.infer import (
+     main,
+     normalize_flat_patch,
+     normalize_inference_paths,
+-    open_temp_zarr_array,
++    store_probability_chunk,
+     parse_args,
+     predict_with_mirror_tta,
+     resolve_patch_stride,
+@@ -43,18 +44,6 @@ from vesuvius.ink_detection.models.model import make_model
+ from .helpers import config_mapping
+ 
+ 
+-def test_temp_accumulation_array_is_explicit_v2(tmp_path):
+-    path = tmp_path / "accumulation.zarr"
+-    array = open_temp_zarr_array(path, shape=(3, 5), chunks=(2, 3))
+-    array[:] = np.arange(15, dtype=np.float32).reshape(3, 5)
+-
+-    metadata = json.loads((path / ".zarray").read_text(encoding="utf-8"))
+-    assert metadata["zarr_format"] == 2
+-    assert tuple(array.shape) == (3, 5)
+-    assert tuple(array.chunks) == (2, 3)
+-    assert np.dtype(array.dtype) == np.dtype(np.float32)
+-
+-
+ def test_pyramid_substitution_and_mask_alignment_warn_factually(tmp_path, caplog):
+     create_group(tmp_path / "pyramid.zarr").create_array("1", shape=(2, 2), chunks=(2, 2), dtype="u1")
+     group = open_group(tmp_path / "pyramid.zarr")
+@@ -247,8 +236,7 @@ def test_blocks_occupancy_blend_accumulation_and_truncating_tiles():
+     accumulator = ChunkAccumulator(
+         shape=(2, 3),
+         chunk_shape=(2, 3),
+-        prob_sum_store=probability,
+-        weight_sum_store=weight,
++        write_chunk=partial(store_probability_chunk, probability, weight),
+         contribution_counts=compute_chunk_contribution_counts(
+             scheduled, chunk_shape=(2, 3)
+         ),
+diff --git a/vesuvius/tests/ink_detection/test_flat_inference_empty_chunks.py b/vesuvius/tests/ink_detection/test_flat_inference_empty_chunks.py
+index 4e6d098..0ec2f3b 100644
+--- a/vesuvius/tests/ink_detection/test_flat_inference_empty_chunks.py
++++ b/vesuvius/tests/ink_detection/test_flat_inference_empty_chunks.py
+@@ -1,5 +1,7 @@
+ """Raw-empty patches complete output chunks without contributing blend weight."""
+ 
++from functools import partial
++
+ import numpy as np
+ import pytest
+ import torch
+@@ -11,6 +13,7 @@ from vesuvius.ink_detection.inference.infer import (
+     compute_chunk_contribution_counts,
+     iter_blocks,
+     run_block_inference,
++    store_probability_chunk,
+ )
+ 
+ 
+@@ -21,8 +24,7 @@ def _accumulator(shape, chunk_shape):
+     accumulator = ChunkAccumulator(
+         shape=shape,
+         chunk_shape=chunk_shape,
+-        prob_sum_store=probability,
+-        weight_sum_store=weight,
++        write_chunk=partial(store_probability_chunk, probability, weight),
+         contribution_counts=compute_chunk_contribution_counts(
+             blocks, chunk_shape=chunk_shape
+         ),
+@@ -60,12 +62,10 @@ def test_raw_empty_tile_releases_chunk_in_either_order(skip_first):
+ def test_only_raw_empty_tiles_do_not_allocate_or_write_chunks():
+     accumulator, probability, weight, blocks = _accumulator((3, 5), (2, 2))
+ 
+-    class RejectWrites:
+-        def __setitem__(self, key, values):
+-            raise AssertionError("raw-empty chunks should keep implicit fill")
++    def reject_writes(*args):
++        raise AssertionError("raw-empty chunks should keep implicit fill")
+ 
+-    accumulator.prob_sum_store = RejectWrites()
+-    accumulator.weight_sum_store = RejectWrites()
++    accumulator.write_chunk = reject_writes
+     for block in blocks:
+         accumulator.skip_tile(
+             y0=block.y0, x0=block.x0,
+diff --git a/vesuvius/tests/ink_detection/test_roi_inference.py b/vesuvius/tests/ink_detection/test_roi_inference.py
+index 3e2d190..ceb40fd 100644
+--- a/vesuvius/tests/ink_detection/test_roi_inference.py
++++ b/vesuvius/tests/ink_detection/test_roi_inference.py
+@@ -1,4 +1,6 @@
+ """Structural regression checks; efficacy is separately on real scroll CT."""
++
++from functools import partial
+ import importlib.util
+ from pathlib import Path
+ import numpy as np
+@@ -47,7 +49,7 @@ def test_clipped_real_prediction_assembly_and_raw_zero_skip(tmp_path):
+     roi=(3,66,5,73);blocks=infer.iter_blocks((80,80),128,64,roi_bounds=roi)
+     dataset=infer.FlatBlockDataset(reader=reader,blocks=blocks,patch_size=128,preprocessing='tifxyz_robust')
+     out=np.zeros((63,68),np.float32);weight=np.zeros_like(out);clipped=[infer.clip_block_to_roi(b,roi) for b in blocks]
+-    accumulator=infer.ChunkAccumulator(shape=out.shape,chunk_shape=(17,23),prob_sum_store=out,weight_sum_store=weight,
++    accumulator=infer.ChunkAccumulator(shape=out.shape,chunk_shape=(17,23),write_chunk=partial(infer.store_probability_chunk,out,weight),
+         contribution_counts=infer.compute_chunk_contribution_counts(clipped,chunk_shape=(17,23)))
+     infer.run_block_inference(loader=DataLoader(dataset,batch_size=1),model=SavedLogitModel(probability),accumulator=accumulator,
+         weight_map=infer.compute_importance_map_2d(patch_size=(128,128),mode='hann').numpy(),mask=None,
+@@ -57,7 +59,7 @@ def test_clipped_real_prediction_assembly_and_raw_zero_skip(tmp_path):
+     assert not accumulator.buffers
+     # Known empty raw input must not acquire artificial ink through normalization.
+     reader._array=np.zeros_like(ct);out.fill(0);weight.fill(0)
+-    accumulator=infer.ChunkAccumulator(shape=out.shape,chunk_shape=(17,23),prob_sum_store=out,weight_sum_store=weight,
++    accumulator=infer.ChunkAccumulator(shape=out.shape,chunk_shape=(17,23),write_chunk=partial(infer.store_probability_chunk,out,weight),
+         contribution_counts=infer.compute_chunk_contribution_counts(clipped,chunk_shape=(17,23)))
+     infer.run_block_inference(loader=DataLoader(dataset,batch_size=1),model=SavedLogitModel(probability),accumulator=accumulator,
+         weight_map=np.ones((128,128),np.float32),mask=None,device=torch.device('cpu'),amp_dtype=None,tta_axes=(),tta_batch_size=None,roi_bounds=roi)
+diff --git a/vesuvius/tests/ink_detection/test_roi_output_metadata.py b/vesuvius/tests/ink_detection/test_roi_output_metadata.py
+index 65cc44b..6752ed6 100644
+--- a/vesuvius/tests/ink_detection/test_roi_output_metadata.py
++++ b/vesuvius/tests/ink_detection/test_roi_output_metadata.py
+@@ -49,3 +49,61 @@ def test_reused_output_never_retains_old_roi_frame(tmp_path, next_roi, max_ram_g
+     else:
+         assert tifffile.imread(output).shape == (68, 72)
+         assert json.loads(metadata.read_text())['roi_row_start_stop_col_start_stop'] == next_roi
++
++
++def test_streamed_tiff_matches_ram_with_partial_tiles_and_empty_blocks(tmp_path):
++    fixture = Path(__file__).parent / 'fixtures/ink_roi_case.npz'
++    with np.load(fixture) as saved:
++        probability = saved['probability'].astype(np.float32)
++    shape = probability.shape
++    tile_shape = (32, 32)
++    blocks = infer.iter_blocks(shape, patch_size=32, stride=17)
++    weight = infer.compute_importance_map_2d(patch_size=tile_shape, mode='hann').numpy()
++
++    def consume(accumulator):
++        for block in blocks:
++            y0, x0, h, w = block.y0, block.x0, block.valid_h, block.valid_w
++            if x0 >= 32:
++                accumulator.skip_tile(y0=y0, x0=x0, valid_h=h, valid_w=w)
++            else:
++                accumulator.add_tile(
++                    y0=y0, x0=x0, tile=probability[y0:y0+h, x0:x0+w],
++                    tile_weights=weight[:h, :w],
++                )
++
++    outputs = [tmp_path / 'ram.tif', tmp_path / 'streamed.tif']
++    for output, limit in zip(outputs, [1, 0]):
++        infer.write_flat_output(
++            output_path=output, output_shape=shape, tile_shape=tile_shape,
++            blocks=blocks, max_ram_accumulation_gb=limit, consume=consume,
++        )
++
++    a, b = (tifffile.imread(path) for path in outputs)
++    assert a.any() and not a[:, -1].any()
++    np.testing.assert_array_equal(a, b)
++    with tifffile.TiffFile(outputs[1]) as tiff:
++        assert tiff.pages[0].is_tiled
++        assert tiff.pages[0].compression.name == 'LZW'
++
++
++def test_streamed_empty_tiff_and_inference_failure(tmp_path):
++    output = tmp_path / 'blank.tif'
++    args = dict(
++        output_path=output, output_shape=(21, 23), tile_shape=(16, 16),
++        blocks=[], max_ram_accumulation_gb=0,
++    )
++    infer.write_flat_output(**args, consume=lambda accumulator: None)
++    np.testing.assert_array_equal(tifffile.imread(output), np.zeros((21, 23), dtype=np.uint8))
++
++    original = output.read_bytes()
++    roi_metadata = output.with_suffix('.tif.roi.json')
++    roi_metadata.write_text('{}')
++
++    def fail(accumulator):
++        raise RuntimeError('interrupted inference')
++
++    with pytest.raises(RuntimeError, match='interrupted inference'):
++        infer.write_flat_output(**args, consume=fail)
++    assert output.read_bytes() == original
++    assert roi_metadata.read_text() == '{}'
++    assert sorted(p.name for p in tmp_path.iterdir()) == ['blank.tif', 'blank.tif.roi.json']
